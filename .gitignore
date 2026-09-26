@@ -1,0 +1,4 @@
+node_modules/
+copycat/
+*.log
+.DS_Store
