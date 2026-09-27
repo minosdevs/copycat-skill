@@ -19,7 +19,7 @@ It handles lazy-loading and reveal-on-scroll, cookie banners (hidden via CSS, ne
 
 ## Install
 
-Requires Node ≥ 18.
+Requires Node ≥ 20.
 
 ```bash
 # personal install (all projects)
@@ -32,7 +32,7 @@ git clone https://github.com/minosdevs/copycat-skill .claude/skills/copycat
 Then install the scripts' dependencies once:
 
 ```bash
-cd ~/.claude/skills/copycat/scripts && npm install && npx playwright install chromium
+cd ~/.claude/skills/copycat/scripts && npm ci && npx playwright install chromium
 ```
 
 ## Usage
@@ -53,7 +53,7 @@ node scripts/capture.mjs https://example.com --out copycat/example.com
 node scripts/compare.mjs --original copycat/example.com --clone http://localhost:3000
 ```
 
-Useful capture options: `--depth 1` (pages in the nav, `--max-pages 8`), `--viewports desktop,mobile` or `--viewports large:1920x1080,desktop`, `--scale 2`, `--dark`, `--locale en-US`, `--wait 3000`, `--videos`, `--channel chrome|msedge` (real installed browser, for bot-protected sites), `--headed`, `--no-hover`.
+Useful capture options: `--depth 1` (nav pages, `--max-pages 8`), `--viewports desktop,mobile` or `--viewports large:1920x1080,desktop`, `--scale 2`, `--dark`, `--locale en-US`, `--wait 3000`, `--videos`, `--channel chrome|msedge`, `--executable-path /path/to/chromium`, `--headed`, `--no-hover`, and `--ignore-https-errors` for a known test certificate.
 
 `scripts/extract.browser.js` can also be pasted as-is into the DevTools console: `copy(JSON.stringify(__copycatExtract(), null, 2))` puts the page's design tokens in your clipboard.
 
