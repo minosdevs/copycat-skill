@@ -3,7 +3,7 @@
 ## La capture
 
 **`Cannot find package 'playwright'`** — les dépendances ne sont pas installées dans `scripts/` :
-`cd <skill>/scripts && npm install && npx playwright install chromium`. Lance toujours les scripts
+`cd <skill>/scripts && npm ci && npx playwright install chromium`. Lance toujours les scripts
 avec leur chemin complet (`node <skill>/scripts/capture.mjs …`), ils résolvent leurs deps depuis leur
 propre dossier.
 

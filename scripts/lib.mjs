@@ -14,6 +14,33 @@ export const DEFAULT_VIEWPORTS = {
 export const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
+export function browserLaunchOptions(args = {}) {
+  if (args.channel && args['executable-path']) {
+    throw new Error('--channel and --executable-path cannot be used together');
+  }
+  const headed = parseBooleanFlag(args.headed, 'headed');
+  if (args.channel !== undefined && !['chrome', 'msedge'].includes(args.channel)) {
+    throw new Error(`Invalid browser channel: ${args.channel}`);
+  }
+  const options = {
+    headless: !headed,
+    args: args.channel ? ['--disable-blink-features=AutomationControlled'] : [],
+  };
+  if (args.channel) options.channel = args.channel;
+  if (args['executable-path']) {
+    try {
+      if (typeof args['executable-path'] !== 'string' || !args['executable-path'].trim()) throw new Error('empty path');
+      const executablePath = fs.realpathSync(path.resolve(args['executable-path']));
+      if (!fs.statSync(executablePath).isFile()) throw new Error('not a regular file');
+      fs.accessSync(executablePath, fs.constants.X_OK);
+      options.executablePath = executablePath;
+    } catch {
+      throw new Error(`--executable-path is not a trusted executable file: ${args['executable-path']}`);
+    }
+  }
+  return options;
+}
+
 export function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -29,22 +56,101 @@ export function parseArgs(argv) {
   return args;
 }
 
+export function validateSafeName(name, label = 'name') {
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(name || '')) {
+    throw new Error(`Invalid ${label}: ${name || '(empty)'}`);
+  }
+  return name;
+}
+
+export function validateViewportNames(screens) {
+  const names = screens && typeof screens === 'object' ? Object.keys(screens) : [];
+  if (names.length === 0) throw new Error('Invalid capture manifest: no screenshots');
+  return names.map((name) => validateSafeName(name, 'viewport name'));
+}
+
+export function validateViewport(viewport, name = 'viewport') {
+  const width = viewport?.width;
+  const height = viewport?.height;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || width > 7680 || height < 1 || height > 4320) {
+    throw new Error(`Invalid viewport dimensions for ${name}: ${width}x${height}`);
+  }
+  return { width, height };
+}
+
 export function parseViewports(spec) {
   if (!spec || spec === true) return DEFAULT_VIEWPORTS;
   const out = {};
   for (const part of String(spec).split(',')) {
-    const [name, size] = part.split(':');
+    const pieces = part.split(':');
+    if (pieces.length > 2) throw new Error(`Invalid viewport dimensions: ${part}`);
+    const [rawName, size] = pieces;
+    const name = validateSafeName(rawName, 'viewport name');
     if (size) {
-      const [w, h] = size.split('x').map(Number);
-      out[name] = { width: w, height: h };
-    } else if (DEFAULT_VIEWPORTS[name]) out[name] = DEFAULT_VIEWPORTS[name];
+      const match = /^(\d+)x(\d+)$/.exec(size);
+      const w = match ? Number(match[1]) : NaN;
+      const h = match ? Number(match[2]) : NaN;
+      out[name] = validateViewport({ width: w, height: h }, name);
+    } else if (DEFAULT_VIEWPORTS[name]) {
+      out[name] = DEFAULT_VIEWPORTS[name];
+    } else {
+      throw new Error(`Unknown viewport: ${name}`);
+    }
   }
   return Object.keys(out).length ? out : DEFAULT_VIEWPORTS;
+}
+
+export function parseBooleanFlag(value, name) {
+  if (value === undefined || value === false) return false;
+  if (value === true) return true;
+  throw new Error(`--${name} does not accept a value`);
+}
+
+export function parseBoundedNumber(value, { name, defaultValue, min, max, integer = true }) {
+  if (value === undefined || value === null || value === false) return defaultValue;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || (integer && !Number.isInteger(parsed)) || parsed < min || parsed > max) {
+    throw new Error(`Invalid ${name}: ${value} (expected ${integer ? 'an integer' : 'a number'} between ${min} and ${max})`);
+  }
+  return parsed;
+}
+
+export function resolveInside(root, ...segments) {
+  const base = path.resolve(root);
+  if (fs.existsSync(base) && fs.lstatSync(base).isSymbolicLink()) {
+    throw new Error(`Refusing symbolic link in output path: ${base}`);
+  }
+  const candidate = path.resolve(base, ...segments);
+  if (candidate !== base && !candidate.startsWith(base + path.sep)) {
+    throw new Error(`Refusing path outside output directory: ${candidate}`);
+  }
+  let current = base;
+  const relative = path.relative(base, candidate);
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) {
+      throw new Error(`Refusing symbolic link in output path: ${current}`);
+    }
+  }
+  return candidate;
 }
 
 export function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); return p; }
 export function writeJson(p, data) { fs.writeFileSync(p, JSON.stringify(data, null, 2)); }
 export function readJson(p) { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+export function isViewportComparisonComplete(viewportResult) {
+  return !viewportResult?.error
+    && Boolean(viewportResult?.cloneFull)
+    && !viewportResult?.diff?.error
+    && Number.isFinite(viewportResult?.diff?.mismatchPercent);
+}
+
+export function isSameSiteHost(hostname, siteHost) {
+  const candidate = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  const base = String(siteHost || '').toLowerCase().replace(/\.$/, '');
+  return candidate === base || candidate.endsWith('.' + base);
+}
+
 export function slugify(s) {
   return String(s).toLowerCase().replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'root';
 }
@@ -150,7 +256,13 @@ export async function robustGoto(page, url, { timeout = 45000, settle = 1500 } =
   return how;
 }
 
-export async function newContext(browser, viewport, { scale = 1, locale = 'en-US', colorScheme = 'light', mobile = false } = {}) {
+export async function newContext(browser, viewport, {
+  scale = 1,
+  locale = 'en-US',
+  colorScheme = 'light',
+  mobile = false,
+  ignoreHTTPSErrors = false,
+} = {}) {
   return browser.newContext({
     viewport,
     deviceScaleFactor: scale,
@@ -159,7 +271,7 @@ export async function newContext(browser, viewport, { scale = 1, locale = 'en-US
     hasTouch: mobile,
     locale,
     colorScheme,
-    ignoreHTTPSErrors: true,
+    ignoreHTTPSErrors,
     serviceWorkers: 'block',
   });
 }

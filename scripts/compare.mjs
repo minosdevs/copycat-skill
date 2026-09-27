@@ -4,6 +4,7 @@
  *
  *   node compare.mjs --original <capture-dir> --clone <url> [--viewports desktop,mobile]
  *                    [--out <capture-dir>/compare] [--threshold 0.1] [--wait 0] [--dark]
+ *                    [--channel chrome|msedge | --executable-path path] [--ignore-https-errors]
  *
  * For every viewport of the original capture:
  *   - loads the clone the same way (same viewport, scroll, fonts ready, animations frozen)
@@ -19,33 +20,53 @@ import { chromium } from 'playwright';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import {
-  parseArgs, parseViewports, ensureDir, writeJson, readJson, pad2, log,
+  parseArgs, parseViewports, parseBooleanFlag, parseBoundedNumber, resolveInside, validateViewport, validateViewportNames, isViewportComparisonComplete, browserLaunchOptions,
+  ensureDir, writeJson, readJson, pad2, log,
   runExtract, attachRecorders, autoScroll, robustGoto, newContext, fullPageShot, foldShots, stitchFolds,
 } from './lib.mjs';
 
 const args = parseArgs(process.argv.slice(2));
-const ORIG = path.resolve(args.original || args._[0] || '');
+const ORIG_INPUT = path.resolve(args.original || args._[0] || '');
 const CLONE = args.clone || args._[1];
-if (!ORIG || !CLONE || !fs.existsSync(path.join(ORIG, 'manifest.json'))) {
+if (!ORIG_INPUT || !CLONE || !fs.existsSync(path.join(ORIG_INPUT, 'manifest.json'))) {
   console.error('usage: node compare.mjs --original <capture-dir with manifest.json> --clone <url>');
   process.exit(1);
 }
+const ORIG = fs.realpathSync(ORIG_INPUT);
 const cloneUrl = /^https?:\/\//i.test(CLONE) ? CLONE : 'http://' + CLONE;
 const orig = readJson(path.join(ORIG, 'manifest.json'));
+if (!orig.options || !orig.options.viewports || !orig.screens || !orig.viewports) {
+  throw new Error('Invalid capture manifest: missing viewport metadata');
+}
+const ORIGINAL_SCALE = parseBoundedNumber(orig.options.scale, { name: 'manifest scale', defaultValue: 1, min: 1, max: 2, integer: false });
+const ORIGINAL_LOCALE = typeof orig.options.locale === 'string' && orig.options.locale.length > 0 && orig.options.locale.length <= 100
+  ? orig.options.locale
+  : 'en-US';
+const ORIGINAL_COLOR_SCHEME = ['light', 'dark', 'no-preference'].includes(orig.options.colorScheme)
+  ? orig.options.colorScheme
+  : 'light';
 const OUT = ensureDir(path.resolve(args.out || path.join(ORIG, 'compare')));
-const THRESHOLD = Number(args.threshold || 0.1);
-const EXTRA_WAIT = Number(args.wait || 0);
-const wanted = args.viewports ? Object.keys(parseViewports(args.viewports)) : Object.keys(orig.screens);
+const outPath = (...segments) => resolveInside(OUT, ...segments);
+const THRESHOLD = parseBoundedNumber(args.threshold, { name: 'threshold', defaultValue: 0.1, min: 0, max: 1, integer: false });
+const EXTRA_WAIT = parseBoundedNumber(args.wait, { name: 'wait', defaultValue: 0, min: 0, max: 60000 });
+const DARK = parseBooleanFlag(args.dark, 'dark');
+const IGNORE_HTTPS_ERRORS = parseBooleanFlag(args['ignore-https-errors'], 'ignore-https-errors');
+const wanted = validateViewportNames(args.viewports ? parseViewports(args.viewports) : orig.screens);
 const rel = (p) => path.relative(OUT, p).split(path.sep).join('/');
 
 const result = { tool: 'copycat compare', original: orig.url, clone: cloneUrl, comparedAt: new Date().toISOString(), viewports: {}, design: null, verdict: null };
-const browser = await chromium.launch({ headless: !args.headed, channel: args.channel || undefined, args: args.channel ? ['--disable-blink-features=AutomationControlled'] : [] });
+const browser = await chromium.launch(browserLaunchOptions(args));
 try {
   for (const name of wanted) {
-    const vp = orig.options.viewports[name];
-    if (!vp) { log(`viewport ${name} not in original capture, skipped`); continue; }
+    const vp = validateViewport(orig.options.viewports[name], name);
     log(`▶ ${name} ${vp.width}x${vp.height}`);
-    const context = await newContext(browser, vp, { scale: orig.options.scale || 1, locale: orig.options.locale || 'en-US', colorScheme: args.dark ? 'dark' : (orig.options.colorScheme || 'light'), mobile: vp.width < 768 });
+    const context = await newContext(browser, vp, {
+      scale: ORIGINAL_SCALE,
+      locale: ORIGINAL_LOCALE,
+      colorScheme: DARK ? 'dark' : ORIGINAL_COLOR_SCHEME,
+      mobile: vp.width < 768,
+      ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS,
+    });
     const page = await context.newPage();
     const rec = attachRecorders(page);
     const vres = { viewport: vp, error: null };
@@ -53,8 +74,9 @@ try {
       await robustGoto(page, cloneUrl, { timeout: 45000 });
       if (EXTRA_WAIT) await page.waitForTimeout(EXTRA_WAIT);
       await autoScroll(page);
-      const dir = ensureDir(path.join(OUT, name));
-      const cloneFull = path.join(OUT, `${name}-clone-full.png`);
+      const cloneScrollHeight = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, document.body.scrollHeight));
+      const dir = ensureDir(outPath(name));
+      const cloneFull = outPath(`${name}-clone-full.png`);
       // use the SAME capture method as the original (native vs stitched) so the diff is fair
       const method = orig.screens[name]?.method || 'native';
       const { shots: folds, vh, total } = await foldShots(page, dir, 'clone');
@@ -64,7 +86,7 @@ try {
       vres.method = method;
       vres.cloneFull = ok ? rel(cloneFull) : null;
       vres.cloneFolds = folds.map((f) => rel(f.file));
-      vres.cloneScrollHeight = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, document.body.scrollHeight));
+      vres.cloneScrollHeight = cloneScrollHeight;
       vres.originalScrollHeight = orig.viewports[name]?.scrollHeight ?? null;
       vres.console = {
         errors: rec.console.filter((c) => c.type === 'error').map((c) => c.text.slice(0, 200)),
@@ -75,15 +97,18 @@ try {
       };
 
       // pixel diff
-      const origFull = orig.screens[name]?.full ? path.join(ORIG, orig.screens[name].full) : null;
-      if (ok && origFull && fs.existsSync(origFull)) {
-        vres.diff = diffImages(origFull, cloneFull, path.join(OUT, `${name}-diff.png`), path.join(OUT, `${name}-side-by-side.png`), THRESHOLD);
-        vres.diff.diffFile = rel(path.join(OUT, `${name}-diff.png`));
-        vres.diff.sideBySide = rel(path.join(OUT, `${name}-side-by-side.png`));
+      const origFull = orig.screens[name]?.full ? resolveInside(ORIG, orig.screens[name].full) : null;
+      const originalAvailable = Boolean(origFull && fs.existsSync(origFull));
+      if (ok && originalAvailable) {
+        const diffFile = outPath(`${name}-diff.png`);
+        const sideBySideFile = outPath(`${name}-side-by-side.png`);
+        vres.diff = diffImages(origFull, cloneFull, diffFile, sideBySideFile, THRESHOLD);
+        vres.diff.diffFile = rel(diffFile);
+        vres.diff.sideBySide = rel(sideBySideFile);
         // map worst bands to original sections
         const secs = orig.viewports[name]?.sections || [];
         vres.diff.worstZones = vres.diff.worstBands.map((b) => ({ ...b, sections: secs.filter((s) => s.rect.y < b.yEnd && s.rect.y + s.rect.h > b.yStart).map((s) => `#${s.index + 1} ${s.tag}${s.id ? '#' + s.id : ''}${s.heading ? ' "' + s.heading.slice(0, 40) + '"' : ''}`) }));
-      } else vres.diff = { error: !origFull ? 'original has no full-page screenshot' : 'clone full-page screenshot failed' };
+      } else vres.diff = { error: !originalAvailable ? 'original has no usable full-page screenshot' : 'clone full-page screenshot failed' };
 
       // design diff (primary viewport only)
       if (orig.design && (name === 'desktop' || name === wanted[0]) && !result.design) {
@@ -101,17 +126,19 @@ try {
 
 // verdict
 const diffs = Object.values(result.viewports).filter((v) => v.diff && v.diff.mismatchPercent != null).map((v) => v.diff.mismatchPercent);
+const viewportErrors = Object.values(result.viewports).filter((v) => !isViewportComparisonComplete(v)).length;
 const consoleIssues = Object.values(result.viewports).reduce((s, v) => s + (v.console ? v.console.errors.length + v.console.pageErrors.length + v.console.failedRequests.length + v.console.httpErrors.length : 0), 0);
 const worst = diffs.length ? Math.max(...diffs) : null;
 result.verdict = {
   worstMismatchPercent: worst,
+  viewportErrors,
   consoleIssues,
   missingFonts: result.design?.fonts.missing.length ?? null,
   missingColors: result.design?.palette.missing.length ?? null,
-  grade: worst == null ? 'n/a' : worst < 2 && consoleIssues === 0 ? 'A — pixel-close' : worst < 6 && consoleIssues === 0 ? 'B — very close, polish remaining' : worst < 15 ? 'C — structure right, details off' : 'D — significant differences',
+  grade: viewportErrors > 0 ? 'D — comparison incomplete' : worst == null ? 'n/a' : worst < 2 && consoleIssues === 0 ? 'A — pixel-close' : worst < 6 && consoleIssues === 0 ? 'B — very close, polish remaining' : worst < 15 ? 'C — structure right, details off' : 'D — significant differences',
 };
-writeJson(path.join(OUT, 'result.json'), result);
-fs.writeFileSync(path.join(OUT, 'REPORT.md'), renderReport(result));
+writeJson(outPath('result.json'), result);
+fs.writeFileSync(outPath('REPORT.md'), renderReport(result));
 console.log(JSON.stringify({ out: OUT, report: path.join(OUT, 'REPORT.md'), ...result.verdict, perViewport: Object.fromEntries(Object.entries(result.viewports).map(([n, v]) => [n, v.diff?.mismatchPercent ?? v.error ?? v.diff?.error])) }, null, 2));
 
 /* ------------------------------------------------------------------ */
@@ -214,7 +241,7 @@ function diffDesign(o, c) {
 function fmtTypo(t) { return `${t.fontFamily} ${t.fontSize}/${t.lineHeight} ${t.fontWeight} ${t.letterSpacing} ${t.color}`; }
 
 function renderReport(r) {
-  const L = [`# copycat compare — ${new URL(r.original).hostname} vs clone`, '', `- Original: ${r.original}`, `- Clone: ${r.clone}`, `- Compared: ${r.comparedAt}`, '', `## Verdict: **${r.verdict.grade}**`, '', `- Worst viewport mismatch: **${r.verdict.worstMismatchPercent ?? 'n/a'}%** of pixels`, `- Console/network issues on the clone: **${r.verdict.consoleIssues}** (target 0)`, `- Fonts missing: ${r.verdict.missingFonts ?? 'n/a'} · palette colours missing: ${r.verdict.missingColors ?? 'n/a'}`, ''];
+  const L = [`# copycat compare — ${new URL(r.original).hostname} vs clone`, '', `- Original: ${r.original}`, `- Clone: ${r.clone}`, `- Compared: ${r.comparedAt}`, '', `## Verdict: **${r.verdict.grade}**`, '', `- Worst viewport mismatch: **${r.verdict.worstMismatchPercent ?? 'n/a'}%** of pixels`, `- Viewport comparison errors: **${r.verdict.viewportErrors}** (target 0)`, `- Console/network issues on the clone: **${r.verdict.consoleIssues}** (target 0)`, `- Fonts missing: ${r.verdict.missingFonts ?? 'n/a'} · palette colours missing: ${r.verdict.missingColors ?? 'n/a'}`, ''];
   L.push('## Per viewport', '');
   for (const [n, v] of Object.entries(r.viewports)) {
     L.push(`### ${n} (${v.viewport.width}×${v.viewport.height})`, '');

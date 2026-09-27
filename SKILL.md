@@ -30,10 +30,10 @@ jamais une font, une couleur ou un espacement : on les lit dans le navigateur. E
 | `compare.mjs --original <dir> --clone <url>` | Mesure l'écart clone vs original (diff pixel, fonts, palette, typo, console) → `compare/REPORT.md` |
 | `extract.browser.js` | L'extracteur in-page, aussi collable tel quel dans la console DevTools (retourne le JSON des design tokens) |
 
-Installation une seule fois (Node ≥ 18) :
+Installation une seule fois (Node ≥ 20) :
 
 ```bash
-cd <chemin-du-skill>/scripts && npm install && npx playwright install chromium
+cd <chemin-du-skill>/scripts && npm ci && npx playwright install chromium
 ```
 
 `<chemin-du-skill>` est le dossier de ce SKILL.md (`~/.claude/skills/copycat` en install perso,
@@ -64,8 +64,9 @@ node <chemin-du-skill>/scripts/capture.mjs https://exemple.com --out copycat/exe
 
 Options utiles : `--depth 1` (pages du nav, max `--max-pages 8`), `--viewports desktop,mobile` ou
 `--viewports large:1920x1080,desktop`, `--scale 2` (retina, plus lourd), `--dark`, `--locale fr-FR`,
-`--wait 3000` (sites lents / animations d'intro), `--videos`, `--channel chrome|msedge` (vrai navigateur
-installé, pour les sites protégés), `--headed` (voir ce qui se passe), `--no-hover` (plus rapide). Compte 1 à 2 minutes pour 3 viewports.
+`--wait 3000` (sites lents / animations d'intro), `--videos`, `--channel chrome|msedge`,
+`--executable-path /chemin/vers/chromium`, `--headed` (voir ce qui se passe), `--no-hover` (plus rapide).
+`--ignore-https-errors` est réservé aux certificats de test connus. Compte 1 à 2 minutes pour 3 viewports.
 
 Le script gère déjà : le scroll complet pour déclencher le lazy-load et les reveal-on-scroll, les
 bannières cookies (masquées en CSS, **sans** cliquer « accepter »), les pages trop hautes pour la

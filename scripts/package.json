@@ -5,9 +5,15 @@
   "type": "module",
   "description": "Playwright capture + pixel compare scripts for the copycat Claude Code skill",
   "scripts": {
-    "setup": "npm install && npx playwright install chromium",
+    "setup": "npm ci && npx playwright install chromium",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check capture.mjs && node --check compare.mjs && node --check copy-assets.mjs && node --check lib.mjs && node --check extract.browser.js",
     "capture": "node capture.mjs",
-    "compare": "node compare.mjs"
+    "compare": "node compare.mjs",
+    "copy-assets": "node copy-assets.mjs"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "pixelmatch": "^6.0.0",

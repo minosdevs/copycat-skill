@@ -5,7 +5,8 @@
  *   node capture.mjs <url> [--out dir] [--viewports desktop,tablet,mobile | name:WxH,...]
  *                          [--scale 1|2] [--depth 0|1] [--max-pages 8] [--no-assets] [--no-css]
  *                          [--no-hover] [--headed] [--locale en-US] [--dark] [--timeout 45000]
- *                          [--wait 0] [--videos] [--channel chrome|msedge]  (real Chrome: passes most bot walls)
+ *                          [--wait 0] [--videos] [--channel chrome|msedge | --executable-path path]
+ *                          [--ignore-https-errors]
  *
  * Output (default ./copycat/<host>/):
  *   REPORT.md                 ← read this first
@@ -24,7 +25,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { chromium } from 'playwright';
 import {
-  parseArgs, parseViewports, ensureDir, writeJson, slugify, pad2, fmtBytes, log,
+  parseArgs, parseViewports, parseBooleanFlag, parseBoundedNumber, resolveInside, isSameSiteHost, browserLaunchOptions,
+  ensureDir, writeJson, slugify, pad2, fmtBytes, log,
   runExtract, attachRecorders, hideConsentOverlays, autoScroll, robustGoto, newContext, fullPageShot, foldShots,
   stitchFolds, blankRowRatio, cropPng,
 } from './lib.mjs';
@@ -38,27 +40,29 @@ if (!target) {
 const url = /^https?:\/\//i.test(target) ? target : 'https://' + target;
 const host = new URL(url).hostname.replace(/^www\./, '');
 const OUT = path.resolve(args.out || path.join('copycat', host));
+const outPath = (...segments) => resolveInside(OUT, ...segments);
 const VIEWPORTS = parseViewports(args.viewports);
-const SCALE = Number(args.scale || 1);
-const DEPTH = Number(args.depth || 0);
-const MAX_PAGES = Number(args['max-pages'] || 8);
+const SCALE = parseBoundedNumber(args.scale, { name: 'scale', defaultValue: 1, min: 1, max: 2, integer: false });
+const DEPTH = parseBoundedNumber(args.depth, { name: 'depth', defaultValue: 0, min: 0, max: 1 });
+const MAX_PAGES = parseBoundedNumber(args['max-pages'], { name: 'max-pages', defaultValue: 8, min: 0, max: 50 });
 const WANT_ASSETS = args.assets !== false;
 const WANT_CSS = args.css !== false;
 const WANT_HOVER = args.hover !== false;
-const WANT_VIDEOS = !!args.videos;
-const TIMEOUT = Number(args.timeout || 45000);
-const EXTRA_WAIT = Number(args.wait || 0);
+const WANT_VIDEOS = parseBooleanFlag(args.videos, 'videos');
+const TIMEOUT = parseBoundedNumber(args.timeout, { name: 'timeout', defaultValue: 45000, min: 1000, max: 120000 });
+const EXTRA_WAIT = parseBoundedNumber(args.wait, { name: 'wait', defaultValue: 0, min: 0, max: 60000 });
 const LOCALE = args.locale || 'en-US';
-const COLOR_SCHEME = args.dark ? 'dark' : 'light';
+const COLOR_SCHEME = parseBooleanFlag(args.dark, 'dark') ? 'dark' : 'light';
+const IGNORE_HTTPS_ERRORS = parseBooleanFlag(args['ignore-https-errors'], 'ignore-https-errors');
 
 const dirs = {
-  screens: ensureDir(path.join(OUT, 'screens')),
-  sections: ensureDir(path.join(OUT, 'screens', 'sections')),
-  hover: ensureDir(path.join(OUT, 'screens', 'hover')),
-  css: ensureDir(path.join(OUT, 'css')),
-  content: ensureDir(path.join(OUT, 'content')),
-  assets: ensureDir(path.join(OUT, 'assets')),
-  pages: DEPTH >= 1 ? ensureDir(path.join(OUT, 'pages')) : path.join(OUT, 'pages'),
+  screens: ensureDir(outPath('screens')),
+  sections: ensureDir(outPath('screens', 'sections')),
+  hover: ensureDir(outPath('screens', 'hover')),
+  css: ensureDir(outPath('css')),
+  content: ensureDir(outPath('content')),
+  assets: ensureDir(outPath('assets')),
+  pages: DEPTH >= 1 ? ensureDir(outPath('pages')) : outPath('pages'),
 };
 
 const manifest = {
@@ -67,7 +71,17 @@ const manifest = {
   url,
   host,
   capturedAt: new Date().toISOString(),
-  options: { viewports: VIEWPORTS, scale: SCALE, depth: DEPTH, assets: WANT_ASSETS, css: WANT_CSS, hover: WANT_HOVER, locale: LOCALE, colorScheme: COLOR_SCHEME },
+  options: {
+    viewports: VIEWPORTS,
+    scale: SCALE,
+    depth: DEPTH,
+    assets: WANT_ASSETS,
+    css: WANT_CSS,
+    hover: WANT_HOVER,
+    locale: LOCALE,
+    colorScheme: COLOR_SCHEME,
+    ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS,
+  },
   out: OUT,
   screens: {},
   viewports: {},
@@ -82,7 +96,7 @@ const manifest = {
 
 const rel = (p) => path.relative(OUT, p).split(path.sep).join('/');
 
-const browser = await chromium.launch({ headless: !args.headed, channel: args.channel || undefined, args: args.channel ? ['--disable-blink-features=AutomationControlled'] : [] });
+const browser = await chromium.launch(browserLaunchOptions(args));
 const t0 = Date.now();
 
 try {
@@ -92,7 +106,13 @@ try {
   for (const name of [primary, ...names.filter((n) => n !== primary)]) {
     const vp = VIEWPORTS[name];
     log(`▶ ${name} ${vp.width}x${vp.height}`);
-    const context = await newContext(browser, vp, { scale: SCALE, locale: LOCALE, colorScheme: COLOR_SCHEME, mobile: vp.width < 768 });
+    const context = await newContext(browser, vp, {
+      scale: SCALE,
+      locale: LOCALE,
+      colorScheme: COLOR_SCHEME,
+      mobile: vp.width < 768,
+      ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS,
+    });
     const page = await context.newPage();
     const rec = attachRecorders(page);
 
@@ -113,13 +133,13 @@ try {
     // ---- screenshots, part 1: folds taken while REALLY scrolled (reveal-on-scroll content shows),
     // stitched into a full-page image. Chromium's native full-page capture is taken LAST for this
     // viewport (see part 2): it resizes the viewport and leaves some pages with a broken layout.
-    const foldDir = ensureDir(path.join(dirs.screens, name));
+    const foldDir = ensureDir(outPath('screens', name));
     const { shots: folds, vh, total } = await foldShots(page, foldDir, name);
     const scrollHeight = total;
-    const stitchedFile = path.join(dirs.screens, `${name}-full-stitched.png`);
+    const stitchedFile = outPath('screens', `${name}-full-stitched.png`);
     let stitched = null;
     try { stitched = await stitchFolds(folds, vh, total, stitchedFile); } catch (e) { manifest.warnings.push(`${name}: stitch failed — ${e.message}`); }
-    const fullFinal = path.join(dirs.screens, `${name}-full.png`);
+    const fullFinal = outPath('screens', `${name}-full.png`);
     manifest.screens[name] = { full: null, method: null, native: null, stitched: stitched ? rel(stitchedFile) : null, blankRowRatio: {}, folds: folds.map((f) => ({ file: rel(f.file), y: f.y, h: f.h })), scrollHeight };
 
     // ---- extraction (full on primary, light on others)
@@ -146,7 +166,7 @@ try {
       pageErrors: rec.pageErrors,
       failedRequests: rec.failedRequests,
       httpErrors: rec.responses.filter((r) => r.status >= 400),
-      thirdPartyHosts: Object.entries(rec.responses.reduce((m, r) => { try { const h = new URL(r.url).hostname; if (!h.endsWith(host)) m[h] = (m[h] || 0) + 1; } catch { } return m; }, {})).sort((a, b) => b[1] - a[1]).slice(0, 40).map(([h, n]) => ({ host: h, requests: n })),
+      thirdPartyHosts: Object.entries(rec.responses.reduce((m, r) => { try { const h = new URL(r.url).hostname; if (!isSameSiteHost(h, host)) m[h] = (m[h] || 0) + 1; } catch { } return m; }, {})).sort((a, b) => b[1] - a[1]).slice(0, 40).map(([h, n]) => ({ host: h, requests: n })),
       byType: rec.responses.reduce((m, r) => { m[r.type] = (m[r.type] || 0) + 1; return m; }, {}),
       totalBytes: rec.responses.reduce((s, r) => s + (r.size || 0), 0),
     };
@@ -156,14 +176,14 @@ try {
       manifest.finalUrl = finalUrl;
 
       // ---- raw HTML + text + DOM outline
-      fs.writeFileSync(path.join(dirs.content, 'page.html'), await page.content());
-      fs.writeFileSync(path.join(dirs.content, 'text.md'), `# ${data.meta.title || host}\n\nSource: ${finalUrl}\n\n` + data.textOutline.join('\n') + '\n');
-      fs.writeFileSync(path.join(dirs.content, 'dom-outline.txt'), data.domOutline.join('\n') + '\n');
+      fs.writeFileSync(outPath('content', 'page.html'), await page.content());
+      fs.writeFileSync(outPath('content', 'text.md'), `# ${data.meta.title || host}\n\nSource: ${finalUrl}\n\n` + data.textOutline.join('\n') + '\n');
+      fs.writeFileSync(outPath('content', 'dom-outline.txt'), data.domOutline.join('\n') + '\n');
 
       // ---- section crops (cut from the stitched image, so reveal-on-scroll content is present)
       for (const s of data.sections) {
         if (!stitched || s.rect.h < 40 || s.rect.w < 100) continue;
-        const file = path.join(dirs.sections, `${pad2(s.index + 1)}-${s.tag}${s.id ? '-' + slugify(s.id) : ''}.png`);
+        const file = outPath('screens', 'sections', `${pad2(s.index + 1)}-${s.tag}${s.id ? '-' + slugify(s.id) : ''}.png`);
         try {
           const r = await cropPng(stitchedFile, file, { x: Math.max(0, s.rect.x), y: s.rect.y, w: Math.min(s.rect.w, vp.width - Math.max(0, s.rect.x)), h: Math.min(s.rect.h, 8000) }, SCALE);
           if (r) s.screenshot = rel(file);
@@ -191,7 +211,7 @@ try {
             const entry = { ...cand, changed, cursor: await loc.evaluate((el) => getComputedStyle(el).cursor) };
             if (Object.keys(changed).length && box) {
               const clipBox = { x: Math.max(0, box.x - 12), y: Math.max(0, box.y - 12), width: Math.min(box.width + 24, vp.width), height: Math.min(box.height + 24, vp.height) };
-              const f = path.join(dirs.hover, `${pad2(manifest.hover.length + 1)}-${slugify(cand.text || cand.kind)}-hover.png`);
+              const f = outPath('screens', 'hover', `${pad2(manifest.hover.length + 1)}-${slugify(cand.text || cand.kind)}-hover.png`);
               await page.screenshot({ path: f, clip: clipBox, caret: 'hide' });
               entry.screenshot = rel(f);
             }
@@ -211,16 +231,18 @@ try {
             if (!res.ok()) { manifest.css.push({ href: sh.href, error: 'HTTP ' + res.status() }); continue; }
             const body = await res.text();
             const nameCss = `${pad2(++i)}-${slugify(path.basename(new URL(sh.href).pathname).replace(/\.css$/, '') || 'style')}.css`;
-            fs.writeFileSync(path.join(dirs.css, nameCss), body);
-            manifest.css.push({ href: sh.href, file: rel(path.join(dirs.css, nameCss)), bytes: body.length, accessibleFromJs: sh.accessible });
+            const cssFile = outPath('css', nameCss);
+            fs.writeFileSync(cssFile, body);
+            manifest.css.push({ href: sh.href, file: rel(cssFile), bytes: body.length, accessibleFromJs: sh.accessible });
           } catch (e) {
             manifest.css.push({ href: sh.href, error: String(e.message).split('\n')[0] });
           }
         }
         const inline = await page.evaluate(() => Array.from(document.querySelectorAll('style')).map((s, i) => `/* ---- <style> #${i + 1}${s.id ? ' id=' + s.id : ''}${s.getAttribute('data-href') ? ' data-href=' + s.getAttribute('data-href') : ''} ---- */\n` + s.textContent).join('\n\n'));
         if (inline.trim()) {
-          fs.writeFileSync(path.join(dirs.css, '00-inline-style-tags.css'), inline);
-          manifest.css.unshift({ href: null, file: rel(path.join(dirs.css, '00-inline-style-tags.css')), bytes: inline.length, inline: true });
+          const inlineCssFile = outPath('css', '00-inline-style-tags.css');
+          fs.writeFileSync(inlineCssFile, inline);
+          manifest.css.unshift({ href: null, file: rel(inlineCssFile), bytes: inline.length, inline: true });
         }
       }
 
@@ -266,9 +288,9 @@ try {
               base += ext;
             }
             const hash = crypto.createHash('md5').update(u).digest('hex').slice(0, 6);
-            const dir = ensureDir(path.join(dirs.assets, kind));
-            let file = path.join(dir, base);
-            if (fs.existsSync(file)) file = path.join(dir, base.replace(/(\.[^.]+)?$/, `-${hash}$1`));
+            ensureDir(outPath('assets', kind));
+            let file = outPath('assets', kind, base);
+            if (fs.existsSync(file)) file = outPath('assets', kind, base.replace(/(\.[^.]+)?$/, `-${hash}$1`));
             fs.writeFileSync(file, buf);
             manifest.assets.push({ url: u, kind, file: rel(file), bytes: buf.length, contentType: ct });
           } catch (e) {
@@ -276,16 +298,16 @@ try {
           }
         }
         // inline SVGs (logos, icons)
-        const svgDir = ensureDir(path.join(dirs.assets, 'svg'));
+        ensureDir(outPath('assets', 'svg'));
         data.media.inlineSvgs.forEach((s, i) => {
           if (!s.markup) return;
-          const f = path.join(svgDir, `inline-${pad2(i + 1)}${s.inHeader ? '-header' : ''}${s.ariaLabel ? '-' + slugify(s.ariaLabel) : ''}.svg`);
+          const f = outPath('assets', 'svg', `inline-${pad2(i + 1)}${s.inHeader ? '-header' : ''}${s.ariaLabel ? '-' + slugify(s.ariaLabel) : ''}.svg`);
           fs.writeFileSync(f, s.markup.replace(/^<svg/, '<svg xmlns="http://www.w3.org/2000/svg"').replace(/xmlns="http:\/\/www\.w3\.org\/2000\/svg"(.*?)xmlns="http:\/\/www\.w3\.org\/2000\/svg"/, 'xmlns="http://www.w3.org/2000/svg"$1'));
           s.file = rel(f);
           delete s.markup;
         });
         if (data.nav.logo && data.nav.logo.inlineSvg) {
-          const f = path.join(svgDir, 'logo-header.svg');
+          const f = outPath('assets', 'svg', 'logo-header.svg');
           fs.writeFileSync(f, data.nav.logo.inlineSvg);
           data.nav.logo.file = rel(f);
           delete data.nav.logo.inlineSvg;
@@ -298,7 +320,7 @@ try {
         const candidates = data.links.internal.filter((l) => l.inNav || l.inFooter).concat(data.links.internal).filter((l) => { if (seen.has(l.path)) return false; seen.add(l.path); return true; }).slice(0, MAX_PAGES);
         for (const l of candidates) {
           const slug = slugify(l.path === '/' ? 'home' : l.path);
-          const pdir = ensureDir(path.join(dirs.pages, slug));
+          const pdir = ensureDir(outPath('pages', slug));
           log(`  ↳ page ${l.path}`);
           const p2 = await context.newPage();
           const rec2 = attachRecorders(p2);
@@ -307,22 +329,22 @@ try {
             await robustGoto(p2, l.url, { timeout: TIMEOUT });
             await hideConsentOverlays(p2);
             await autoScroll(p2, { maxSteps: 60 });
-            const fd = ensureDir(path.join(pdir, 'folds'));
+            const fd = ensureDir(outPath('pages', slug, 'folds'));
             const { shots: sh2, vh: vh2, total: tot2 } = await foldShots(p2, fd, primary, { maxFolds: 25 });
-            const st2 = path.join(pdir, `${primary}-full-stitched.png`);
+            const st2 = outPath('pages', slug, `${primary}-full-stitched.png`);
             let stitched2 = null;
             try { stitched2 = await stitchFolds(sh2, vh2, tot2, st2); } catch { }
-            const nativeFile = path.join(pdir, `${primary}-full-native.png`);
+            const nativeFile = outPath('pages', slug, `${primary}-full-native.png`);
             const ok = await fullPageShot(p2, nativeFile); // last: may break the page layout
             const bn = ok ? await blankRowRatio(nativeFile) : null, bs = stitched2 ? await blankRowRatio(st2) : null;
             const useSt = stitched2 && (!ok || (bn != null && bs != null && bn > bs + 0.08));
-            const finalFile = path.join(pdir, `${primary}-full.png`);
+            const finalFile = outPath('pages', slug, `${primary}-full.png`);
             if (ok || stitched2) fs.copyFileSync(useSt ? st2 : nativeFile, finalFile);
             entry.full = (ok || stitched2) ? rel(finalFile) : null;
             entry.method = useSt ? 'stitched' : 'native';
             const d2 = await runExtract(p2, { maxElements: 4000 });
-            fs.writeFileSync(path.join(pdir, 'text.md'), `# ${d2.meta.title}\n\nSource: ${p2.url()}\n\n` + d2.textOutline.join('\n') + '\n');
-            fs.writeFileSync(path.join(pdir, 'page.html'), await p2.content());
+            fs.writeFileSync(outPath('pages', slug, 'text.md'), `# ${d2.meta.title}\n\nSource: ${p2.url()}\n\n` + d2.textOutline.join('\n') + '\n');
+            fs.writeFileSync(outPath('pages', slug, 'page.html'), await p2.content());
             entry.title = d2.meta.title;
             entry.sections = d2.sections.map((s) => ({ tag: s.tag, id: s.id, heading: s.heading, rect: s.rect }));
             entry.consoleErrors = rec2.console.filter((c) => c.type === 'error').length + rec2.pageErrors.length;
@@ -337,7 +359,7 @@ try {
     }
 
     // ---- screenshots, part 2: native full-page capture, taken last (side effects no longer matter)
-    const fullFile = path.join(dirs.screens, `${name}-full-native.png`);
+    const fullFile = outPath('screens', `${name}-full-native.png`);
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.waitForTimeout(300);
     const fullOk = await fullPageShot(page, fullFile);
@@ -357,8 +379,8 @@ try {
 }
 
 manifest.durationMs = Date.now() - t0;
-writeJson(path.join(OUT, 'manifest.json'), manifest);
-fs.writeFileSync(path.join(OUT, 'REPORT.md'), renderReport(manifest));
+writeJson(outPath('manifest.json'), manifest);
+fs.writeFileSync(outPath('REPORT.md'), renderReport(manifest));
 log(`done in ${(manifest.durationMs / 1000).toFixed(1)}s → ${OUT}`);
 console.log(JSON.stringify({ out: OUT, report: path.join(OUT, 'REPORT.md'), manifest: path.join(OUT, 'manifest.json'), viewports: Object.keys(manifest.screens), sections: manifest.design?.sections.length ?? 0, assets: manifest.assets.filter((a) => a.file).length, warnings: manifest.warnings.length }, null, 2));
 

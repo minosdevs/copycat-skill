@@ -217,13 +217,11 @@ Dis dans le livrable que le formulaire n'envoie rien.
 ## 13. Copier les assets dans le projet
 
 ```bash
-node -e '
-const fs=require("fs"),p=require("path");const m=require(process.argv[1]+"/manifest.json");
-const dst=process.argv[2];
-for(const a of m.assets.filter(a=>a.file)){const to=p.join(dst,a.file.replace(/^assets\//,""));fs.mkdirSync(p.dirname(to),{recursive:true});fs.copyFileSync(p.join(process.argv[1],a.file),to);}
-console.log("copied",m.assets.filter(a=>a.file).length,"files to",dst);
-' copycat/exemple.com clone/assets
+node <chemin-du-skill>/scripts/copy-assets.mjs copycat/exemple.com clone/assets
 ```
+
+Le script refuse les chemins absolus, les traversées `..`, les entrées hors de `assets/` et les
+liens symboliques qui sortiraient du dossier de capture ou de destination.
 
 Puis remplace dans le HTML chaque URL d'origine par son `file` local : la correspondance
 `url → file` est dans `manifest.assets[]` (les `_next/image?url=…&w=…` sont nommés
